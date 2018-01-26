@@ -71,6 +71,10 @@ type Transport struct {
 	// If nil, the default is used.
 	ConnPool ClientConnPool
 
+	// Timeout if non-zero is a timeout for IO operations. If the operation
+	// times out the connection will be reset.
+	Timeout time.Duration
+
 	// DisableCompression, if true, prevents the Transport from
 	// requesting compression with an "Accept-Encoding: gzip"
 	// request header when the Request contains no existing
@@ -531,6 +535,29 @@ func (t *Transport) NewClientConn(c net.Conn) (*ClientConn, error) {
 	return t.newClientConn(c, false)
 }
 
+type timeoutReadWriter struct {
+	timeout time.Duration
+	c       net.Conn
+}
+
+func (tc timeoutReadWriter) Read(p []byte) (int, error) {
+	if err := tc.c.SetReadDeadline(time.Now().Add(tc.timeout)); err != nil {
+		return 0, err
+	}
+	n, err := tc.c.Read(p)
+	tc.c.SetReadDeadline(time.Time{})
+	return n, err
+}
+
+func (tc timeoutReadWriter) Write(p []byte) (int, error) {
+	if err := tc.c.SetWriteDeadline(time.Now().Add(tc.timeout)); err != nil {
+		return 0, err
+	}
+	n, err := tc.c.Write(p)
+	tc.c.SetWriteDeadline(time.Time{})
+	return n, err
+}
+
 func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, error) {
 	cc := &ClientConn{
 		t:                     t,
@@ -557,10 +584,15 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 	cc.cond = sync.NewCond(&cc.mu)
 	cc.flow.add(int32(initialWindowSize))
 
+	var rw io.ReadWriter = c
+	if t.Timeout > 0 {
+		rw = timeoutReadWriter{c: c, timeout: t.Timeout}
+	}
+
 	// TODO: adjust this writer size to account for frame size +
 	// MTU + crypto/tls record padding.
-	cc.bw = bufio.NewWriter(stickyErrWriter{c, &cc.werr})
-	cc.br = bufio.NewReader(c)
+	cc.bw = bufio.NewWriter(stickyErrWriter{rw, &cc.werr})
+	cc.br = bufio.NewReader(rw)
 	cc.fr = NewFramer(cc.bw, cc.br)
 	cc.fr.ReadMetaHeaders = hpack.NewDecoder(initialHeaderTableSize, nil)
 	cc.fr.MaxHeaderListSize = t.maxHeaderListSize()

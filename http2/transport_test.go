@@ -7,7 +7,6 @@ package http2
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
@@ -798,6 +797,8 @@ func (r countingReader) Read(p []byte) (n int, err error) {
 func TestTransportTimeoutServerHangs(t *testing.T) {
 	clientDone := make(chan struct{})
 	ct := newClientTester(t)
+	ct.tr.Timeout = 1 * time.Second
+
 	ct.client = func() error {
 		defer ct.cc.(*net.TCPConn).CloseWrite()
 		defer close(clientDone)
@@ -813,10 +814,6 @@ func TestTransportTimeoutServerHangs(t *testing.T) {
 		if err != nil {
 			return err
 		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		defer cancel()
-		req = req.WithContext(ctx)
 		req.Header.Add("Authorization", headerVal)
 		_, err = ct.tr.RoundTrip(req)
 		if err == nil {
