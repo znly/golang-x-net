@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -789,7 +790,6 @@ func (r countingReader) Read(p []byte) (n int, err error) {
 	atomic.AddInt64(r.n, int64(len(p)))
 	return len(p), err
 }
-
 func TestTransportReqBodyAfterResponse_200(t *testing.T) { testTransportReqBodyAfterResponse(t, 200) }
 func TestTransportReqBodyAfterResponse_403(t *testing.T) { testTransportReqBodyAfterResponse(t, 403) }
 
@@ -3835,6 +3835,282 @@ func TestTransportHandlesInvalidStatuslessResponse(t *testing.T) {
 				return nil
 			}
 		}
+	}
+	ct.run()
+}
+
+// Verify that when IOTimeout is set, the client times out when writing header
+// and the server hangs.
+func TestTransportIOTimeout_WriteHeaders(t *testing.T) {
+	clientDone := make(chan struct{})
+	ct := newClientTester(t)
+	ct.tr.IOTimeout = 1 * time.Second
+	ct.client = func() error {
+		defer ct.cc.(*net.TCPConn).CloseWrite()
+		defer close(clientDone)
+
+		buf := make([]byte, 1<<19)
+		_, err := rand.Read(buf)
+		if err != nil {
+			t.Fatal("fail to gen random data")
+		}
+		headerVal := hex.EncodeToString(buf)
+
+		req, err := http.NewRequest("PUT", "https://dummy.tld/", nil)
+		if err != nil {
+			return err
+		}
+
+		req.Header.Add("Authorization", headerVal)
+		_, err = ct.tr.RoundTrip(req)
+		if err == nil {
+			return errors.New("error should not be nil")
+		}
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			return fmt.Errorf("error should be a net error timeout was: %+v", err)
+		}
+		if oe, ok := err.(*net.OpError); !ok || oe.Op != "write" {
+			return fmt.Errorf("error should be an op write error  was: %+v", err)
+		}
+		return nil
+	}
+	ct.server = func() error {
+		ct.greet()
+		select {
+		case <-time.After(5 * time.Second):
+			return errors.New("client should have timed out")
+		case <-clientDone:
+		}
+		return nil
+	}
+	ct.run()
+}
+
+// Verify that when IOTimeout is set the client times out when writing the body
+// and the server doesn't writes flow control frames.
+func TestTransportIOTimeout_WriteBodyFlowControl(t *testing.T) {
+	clientDone := make(chan struct{})
+	ct := newClientTester(t)
+	ct.tr.IOTimeout = 1 * time.Second
+	ct.client = func() error {
+		defer ct.cc.(*net.TCPConn).CloseWrite()
+		defer close(clientDone)
+
+		buf := make([]byte, 1<<20)
+		_, err := rand.Read(buf)
+		if err != nil {
+			t.Fatal("fail to gen random data")
+		}
+
+		req, err := http.NewRequest("PUT", "https://dummy.tld/", bytes.NewReader(buf))
+		if err != nil {
+			return err
+		}
+		_, err = ct.tr.RoundTrip(req)
+		if err == nil {
+			return errors.New("error should not be nil")
+		}
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			return fmt.Errorf("error should be a net error timeout was: %+v", err)
+		}
+		if oe, ok := err.(*net.OpError); !ok || oe.Op != "read" {
+			return fmt.Errorf("error should be an op read error was: %+v", err)
+		}
+		return nil
+	}
+	ct.server = func() error {
+		ct.greet()
+		for {
+			fr, err := ct.readNonSettingsFrame()
+			if err != nil {
+				return fmt.Errorf("unexpected error: %v", err)
+			}
+			if _, ok := fr.(*HeadersFrame); !ok {
+				continue
+			}
+			select {
+			case <-time.After(5 * time.Second):
+			case <-clientDone:
+			}
+			return nil
+		}
+	}
+	ct.run()
+}
+
+// Verify that when IOTimeout is set, the client times out when reading response
+// headers.
+func TestTransportIOTimeout_ReadResponseHeaders(t *testing.T) {
+	clientDone := make(chan struct{})
+	ct := newClientTester(t)
+	ct.tr.IOTimeout = 1 * time.Second
+	ct.client = func() error {
+		defer ct.cc.(*net.TCPConn).CloseWrite()
+		defer close(clientDone)
+
+		req, err := http.NewRequest("PUT", "https://dummy.tld/", nil)
+		if err != nil {
+			return err
+		}
+		_, err = ct.tr.RoundTrip(req)
+		if err == nil {
+			return errors.New("error should not be nil")
+		}
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			return fmt.Errorf("error should be a net error timeout was: %+v", err)
+		}
+		if oe, ok := err.(*net.OpError); !ok || oe.Op != "read" {
+			return fmt.Errorf("error should be an op read error was: %+v", err)
+		}
+		return nil
+	}
+	ct.server = func() error {
+		ct.greet()
+		for {
+			fr, err := ct.readNonSettingsFrame()
+			if err != nil {
+				return fmt.Errorf("unexpected error: %v", err)
+			}
+			if _, ok := fr.(*HeadersFrame); !ok {
+				continue
+			}
+			select {
+			case <-time.After(5 * time.Second):
+			case <-clientDone:
+			}
+			return nil
+		}
+	}
+	ct.run()
+}
+
+// Verify that when IOTimeout is set the client times out when writing the body
+// and the server does not read it.
+func TestTransportIOTimeout_WriteBody(t *testing.T) {
+	clientDone := make(chan struct{})
+	ct := newClientTester(t)
+	ct.tr.IOTimeout = 2 * time.Second
+	bodySize := 1 << 24
+	ct.client = func() error {
+		defer ct.cc.(*net.TCPConn).CloseWrite()
+		defer close(clientDone)
+
+		buf := make([]byte, bodySize)
+		req, err := http.NewRequest("PUT", "https://dummy.tld/", bytes.NewReader(buf))
+		if err != nil {
+			return err
+		}
+		_, err = ct.tr.RoundTrip(req)
+		if err == nil {
+			return errors.New("error should not be nil")
+		}
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			return fmt.Errorf("error should be a net error timeout was: %+v", err)
+		}
+		if oe, ok := err.(*net.OpError); !ok || oe.Op != "write" {
+			return fmt.Errorf("error should be an op write error was: %+v", err)
+		}
+
+		return nil
+	}
+	ct.server = func() error {
+		ct.greet()
+
+		done := make(chan struct{})
+		defer close(done)
+		for {
+			f, err := ct.readFrame()
+			if err != nil {
+				return fmt.Errorf("unexpected error: %v", err)
+			}
+			if f, ok := f.(*DataFrame); ok {
+				dataLen := len(f.Data())
+				t.Logf("datalen=%v", dataLen)
+				go func() {
+					for i := 0; i < bodySize/dataLen; i++ {
+						if err := ct.fr.WriteWindowUpdate(0, uint32(dataLen)); err != nil {
+							return
+						}
+						if err := ct.fr.WriteWindowUpdate(f.StreamID, uint32(dataLen)); err != nil {
+							return
+						}
+						select {
+						case <-done:
+							return
+						default:
+						}
+					}
+				}()
+
+				select {
+				case <-time.After(10 * time.Second):
+					return errors.New("client should have timed out")
+				case <-clientDone:
+					return nil
+				}
+			}
+		}
+	}
+	ct.run()
+}
+
+// Verify that when IOTimeout is set, the response body read will timeout if the
+// server hangs .
+func TestTransportIOTimeout_ReadBody(t *testing.T) {
+	clientDone := make(chan struct{})
+	ct := newClientTester(t)
+	ct.tr.IOTimeout = 1 * time.Second
+
+	ct.client = func() error {
+		defer ct.cc.(*net.TCPConn).CloseWrite()
+		defer close(clientDone)
+
+		req, err := http.NewRequest("GET", "https://dummy.tld/", nil)
+		if err != nil {
+			return err
+		}
+
+		res, err := ct.tr.RoundTrip(req)
+		if err != nil {
+			return fmt.Errorf("roundtrip should not return error: %v", err)
+		}
+		p := make([]byte, 5000)
+
+		_, err = res.Body.Read(p)
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			return fmt.Errorf("error should be a net error timeout was: %+v", err)
+		}
+
+		_, err = res.Body.Read(p)
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			return fmt.Errorf("error should be a net error timeout was: %+v", err)
+		}
+		return nil
+	}
+	ct.server = func() error {
+		ct.greet()
+		hf, err := ct.firstHeaders()
+		if err != nil {
+			return err
+		}
+
+		var buf bytes.Buffer
+		enc := hpack.NewEncoder(&buf)
+		enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+		enc.WriteField(hpack.HeaderField{Name: "content-length", Value: "5000"})
+		ct.fr.WriteHeaders(HeadersFrameParam{
+			StreamID:      hf.StreamID,
+			EndHeaders:    true,
+			EndStream:     false,
+			BlockFragment: buf.Bytes(),
+		})
+
+		select {
+		case <-time.After(5 * time.Second):
+			return errors.New("client should have timed out")
+		case <-clientDone:
+		}
+		return nil
 	}
 	ct.run()
 }
